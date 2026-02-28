@@ -1,0 +1,14 @@
+{
+  "name": "Optimite Figma to Klaviyo",
+  "id": "optimite-figma-to-klaviyo-master",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["none"],
+    "devAllowedDomains": [
+      "https://<your-railway-domain>"
+    ]
+  }
+}
