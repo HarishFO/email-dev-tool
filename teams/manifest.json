@@ -8,7 +8,7 @@
   "networkAccess": {
     "allowedDomains": ["none"],
     "devAllowedDomains": [
-      "https://email-dev-tool-production.up.railway.app/"
+      "https://email-dev-slice-tool-production.up.railway.app/"
     ]
   }
 }
