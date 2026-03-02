@@ -41,25 +41,61 @@ function normalizeAccountId(raw) {
   return val.replace(/[^a-z0-9_-]/g, '');
 }
 
-function readConfiguredAccounts() {
-  const configured = String(process.env.KLAVIYO_ACCOUNTS || '')
-    .split(',')
-    .map((v) => normalizeAccountId(v))
-    .filter(Boolean);
-  return Array.from(new Set(configured));
-}
-
 function accountEnvKey(accountId) {
   return `KLAVIYO_API_KEY_${String(accountId || '')
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '_')}`;
 }
 
+// Auto-discover from KLAVIYO_API_KEY_*
+// Optional label: KLAVIYO_ACCOUNT_NAME_<ID>
+// Optional ordering/filter: KLAVIYO_ACCOUNTS=brick,tc,optimite
+function readConfiguredAccounts() {
+  const discovered = [];
+
+  for (const [key] of Object.entries(process.env)) {
+    if (!key.startsWith('KLAVIYO_API_KEY_')) continue;
+
+    const suffix = key.replace('KLAVIYO_API_KEY_', '');
+    if (!suffix || suffix === 'DEFAULT') continue;
+
+    const id = normalizeAccountId(suffix.replace(/_/g, '-'));
+    if (!id) continue;
+
+    const name = process.env[`KLAVIYO_ACCOUNT_NAME_${suffix}`] || id;
+    discovered.push({ id, name });
+  }
+
+  const seen = new Set();
+  const deduped = [];
+  for (const a of discovered) {
+    if (seen.has(a.id)) continue;
+    seen.add(a.id);
+    deduped.push(a);
+  }
+
+  const orderedRaw = String(process.env.KLAVIYO_ACCOUNTS || '')
+    .split(',')
+    .map((v) => normalizeAccountId(v))
+    .filter(Boolean);
+
+  if (!orderedRaw.length) {
+    return deduped.sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  const map = new Map(deduped.map((a) => [a.id, a]));
+  const ordered = [];
+  for (const id of orderedRaw) {
+    if (map.has(id)) ordered.push(map.get(id));
+  }
+  return ordered;
+}
+
 function resolveApiKey(accountIdRaw) {
   const accountId = normalizeAccountId(accountIdRaw);
   const configured = readConfiguredAccounts();
 
-  if (accountId) {
+  if (accountId && accountId !== 'default') {
     const envName = accountEnvKey(accountId);
     const key = process.env[envName];
     if (!key) {
@@ -71,19 +107,30 @@ function resolveApiKey(accountIdRaw) {
     return { ok: true, accountId, apiKey: key, source: envName };
   }
 
-  const fallback = process.env.KLAVIYO_API_KEY || process.env.KLAVIYO_PRIVATE_KEY;
+  const fallback =
+    process.env.KLAVIYO_API_KEY_DEFAULT ||
+    process.env.KLAVIYO_API_KEY ||
+    process.env.KLAVIYO_PRIVATE_KEY;
+
   if (fallback) {
-    return { ok: true, accountId: 'default', apiKey: fallback, source: process.env.KLAVIYO_API_KEY ? 'KLAVIYO_API_KEY' : 'KLAVIYO_PRIVATE_KEY' };
+    return {
+      ok: true,
+      accountId: 'default',
+      apiKey: fallback,
+      source: process.env.KLAVIYO_API_KEY_DEFAULT
+        ? 'KLAVIYO_API_KEY_DEFAULT'
+        : (process.env.KLAVIYO_API_KEY ? 'KLAVIYO_API_KEY' : 'KLAVIYO_PRIVATE_KEY')
+    };
   }
 
   if (configured.length) {
-    const first = configured[0];
+    const first = configured[0].id;
     const envName = accountEnvKey(first);
     const key = process.env[envName];
     if (key) return { ok: true, accountId: first, apiKey: key, source: envName };
   }
 
-  return { ok: false, error: 'No Klaviyo API key found. Configure KLAVIYO_API_KEY or KLAVIYO_API_KEY_<ACCOUNT_ID>.' };
+  return { ok: false, error: 'No Klaviyo API key found. Configure KLAVIYO_API_KEY_DEFAULT or KLAVIYO_API_KEY_<ACCOUNT_ID>.' };
 }
 
 function buildAutoVerticalSlices(logicalWidth, bodyTop, bodyBottom, maxSliceHeight) {
@@ -277,9 +324,17 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/accounts', (_req, res) => {
   const list = readConfiguredAccounts();
-  const fallbackExists = Boolean(process.env.KLAVIYO_API_KEY || process.env.KLAVIYO_PRIVATE_KEY);
-  const accounts = fallbackExists ? ['default', ...list] : list;
-  res.json({ ok: true, accounts: Array.from(new Set(accounts)) });
+  const fallbackExists = Boolean(
+    process.env.KLAVIYO_API_KEY_DEFAULT ||
+    process.env.KLAVIYO_API_KEY ||
+    process.env.KLAVIYO_PRIVATE_KEY
+  );
+
+  const accounts = fallbackExists
+    ? [{ id: 'default', name: 'Default' }, ...list]
+    : list;
+
+  res.json({ ok: true, accounts });
 });
 
 app.post('/api/push', async (req, res) => {
@@ -324,7 +379,7 @@ app.post('/api/push', async (req, res) => {
       manualSlices: Array.isArray(manualSlices) ? manualSlices : []
     });
 
-    const slices = built.slices.map((s, idx) => ({
+    const slicesOut = built.slices.map((s, idx) => ({
       index: idx + 1,
       x: s.x,
       y: s.y,
@@ -345,11 +400,11 @@ app.post('/api/push', async (req, res) => {
       accountId: resolved.accountId,
       batchName: safeBatchName,
       frameName: frameName || null,
-      sliceCount: slices.length,
+      sliceCount: slicesOut.length,
       mode: 'v11-upload-only',
       manualMode: Array.isArray(manualSlices) && manualSlices.length > 0,
       targetSliceKb,
-      slices
+      slices: slicesOut
     });
   } catch (error) {
     res.status(500).json({ error: String(error?.message || error) });
