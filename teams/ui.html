@@ -22,6 +22,7 @@
     .field label { display: block; margin-bottom: 4px; font-weight: 600; color: var(--opt-ink); }
     input, select { width: 100%; border: 1px solid var(--opt-border); border-radius: 6px; padding: 8px; font-size: 12px; background: var(--opt-surface); }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
     .btn { width: 100%; border: 0; border-radius: 8px; padding: 10px; cursor: pointer; font-weight: 700; }
     .btn-muted { background: #e2e8f0; color: var(--opt-ink); }
     .btn-primary { background: var(--opt-primary); color: #fff; }
@@ -54,7 +55,7 @@
     var errorMsg = null;
 
     var batchName = '';
-    var backendUrl = 'http://localhost:8787';
+    var backendUrl = "https://email-dev-slice-tool-production.up.railway.app/";
     var accountId = 'default';
     var availableAccounts = [];
     var headerHeight = '0';
@@ -67,6 +68,7 @@
     var addSliceMode = false;
     var draw = { active: false, startX: 0, startY: 0, currentX: 0, currentY: 0, pointerId: null };
     var MIN_SLICE_SIZE = 8;
+    var X_OVERLAP_THRESHOLD = 16;
     var teardownOutsideClick = null;
 
     var status = '';
@@ -100,6 +102,12 @@
       return { x: x, y: y, width: w, height: h };
     }
 
+    function overlapX(a, b) {
+      var left = Math.max(a.x, b.x);
+      var right = Math.min(a.x + a.width, b.x + b.width);
+      return Math.max(0, right - left);
+    }
+
     function resetWorkingState() {
       preview = { ready: false, base64: '', width: 0, height: 0, displayWidth: 0, displayHeight: 0 };
       slices = [];
@@ -107,72 +115,104 @@
       addSliceMode = false;
     }
 
-    function getVerticalOrder() {
-      var order = [];
-      for (var i = 0; i < slices.length; i++) {
-        if (!slices[i] || !slices[i].rect) continue;
-        order.push({ idx: i, y: slices[i].rect.y, x: slices[i].rect.x });
+    function getAccountOptionsHtml() {
+      if (!availableAccounts.length) return '';
+      var html = '';
+      for (var i = 0; i < availableAccounts.length; i++) {
+        var a = availableAccounts[i];
+        html += '<option value="' + esc(a.id) + '"' + (a.id === accountId ? ' selected' : '') + '>' + esc(a.name || a.id) + '</option>';
       }
-      order.sort(function(a, b) {
-        if (a.y !== b.y) return a.y - b.y;
-        return a.x - b.x;
-      });
-      return order;
+      return html;
     }
 
-    function clampRectAgainstNeighbors(index, rect) {
+    function clampRectAgainstNeighbors(index, rect, previousRect) {
       var r = normalizeRect(rect);
       if (!preview.ready || index < 0 || index >= slices.length) return r;
 
-      function horizontalOverlap(a, b) {
-        var aLeft = a.x;
-        var aRight = a.x + a.width;
-        var bLeft = b.x;
-        var bRight = b.x + b.width;
-        return Math.min(aRight, bRight) - Math.max(aLeft, bLeft) > 0;
-      }
-
       var minY = 0;
       var maxBottom = preview.height;
+      var hasConstraint = false;
 
-      var order = getVerticalOrder().filter(function(entry) {
-        if (entry.idx === index) return true;
-        var other = slices[entry.idx];
-        if (!other || !other.rect) return false;
-        return horizontalOverlap(r, other.rect);
+      for (var i = 0; i < slices.length; i++) {
+        if (i === index) continue;
+        var other = slices[i] && slices[i].rect;
+        if (!other) continue;
+
+        var ox = overlapX(r, other);
+        if (ox < X_OVERLAP_THRESHOLD) continue;
+
+        hasConstraint = true;
+        var cCenter = r.y + (r.height / 2);
+        var otherTop = other.y;
+        var otherBottom = other.y + other.height;
+
+        if (cCenter <= otherTop) {
+          maxBottom = Math.min(maxBottom, otherTop);
+        } else if (cCenter >= otherBottom) {
+          minY = Math.max(minY, otherBottom);
+        } else {
+          var distToTop = Math.abs(cCenter - otherTop);
+          var distToBottom = Math.abs(cCenter - otherBottom);
+          if (distToTop <= distToBottom) maxBottom = Math.min(maxBottom, otherTop);
+          else minY = Math.max(minY, otherBottom);
+        }
+      }
+
+      if (!hasConstraint) return r;
+      if (maxBottom - minY < MIN_SLICE_SIZE) {
+        return previousRect ? normalizeRect(previousRect) : r;
+      }
+
+      var newY = clamp(r.y, minY, Math.max(minY, maxBottom - MIN_SLICE_SIZE));
+      var maxH = maxBottom - newY;
+      var newH = clamp(r.height, MIN_SLICE_SIZE, maxH);
+
+      if (newH < MIN_SLICE_SIZE) {
+        return previousRect ? normalizeRect(previousRect) : r;
+      }
+
+      r.y = newY;
+      r.height = newH;
+      return normalizeRect(r);
+    }
+
+    function cloneSelectedSlice() {
+      var s = getSelectedSlice();
+      if (!s) return;
+
+      var base = normalizeRect({
+        x: s.rect.x,
+        y: s.rect.y + 20,
+        width: s.rect.width,
+        height: s.rect.height
       });
 
-      var pos = -1;
-      for (var i = 0; i < order.length; i++) {
-        if (order[i].idx === index) {
-          pos = i;
+      var idx = slices.length;
+      var candidate = base;
+
+      for (var attempt = 0; attempt < 20; attempt++) {
+        var shifted = normalizeRect({
+          x: base.x,
+          y: base.y + (attempt * 16),
+          width: base.width,
+          height: base.height
+        });
+        var clamped = clampRectAgainstNeighbors(idx, shifted, shifted);
+        if (clamped.height >= MIN_SLICE_SIZE) {
+          candidate = clamped;
           break;
         }
       }
 
-      if (pos > 0) {
-        var prevIdx = order[pos - 1].idx;
-        if (slices[prevIdx] && slices[prevIdx].rect) {
-          var prev = slices[prevIdx].rect;
-          minY = Math.max(minY, prev.y + prev.height);
-        }
-      }
+      slices.push({
+        rect: candidate,
+        url: s.url || '',
+        label: (s.label || '') ? (s.label + ' copy') : '',
+        alt: s.alt || ''
+      });
 
-      if (pos >= 0 && pos < order.length - 1) {
-        var nextIdx = order[pos + 1].idx;
-        if (slices[nextIdx] && slices[nextIdx].rect) {
-          var next = slices[nextIdx].rect;
-          maxBottom = Math.min(maxBottom, next.y);
-        }
-      }
-
-      if (maxBottom <= minY) {
-        return { x: r.x, y: clamp(minY, 0, Math.max(0, preview.height - 1)), width: r.width, height: MIN_SLICE_SIZE };
-      }
-
-      r.y = clamp(r.y, minY, maxBottom - 1);
-      r.height = clamp(r.height, MIN_SLICE_SIZE, maxBottom - r.y);
-      return r;
+      selectedSliceIndex = slices.length - 1;
+      render();
     }
 
     function render() {
@@ -193,17 +233,14 @@
       html += '<div class="row" style="margin-bottom:10px;"><button id="lockBtn" class="btn btn-muted">Lock Frame</button><button id="unlockBtn" class="btn btn-muted">Unlock Frame</button></div>';
 
       html += '<div class="field"><label>Batch Name</label><input id="batchInput" value="' + esc(batchName) + '" placeholder="Brand Campaign Name" /></div>';
-      html += '<div class="field"><label>Backend URL</label><input id="backendInput" value="' + esc(backendUrl) + '" placeholder="http://localhost:8787" /></div>';
+      html += '<div class="field"><label>Backend URL</label><input id="backendInput" value="' + esc(backendUrl) + '" placeholder="https://your-railway-domain.up.railway.app" /></div>';
+
       if (availableAccounts.length) {
-        html += '<div class="field"><label>Klaviyo Account</label><select id="accountInput">';
-        for (var ai = 0; ai < availableAccounts.length; ai++) {
-          var a = availableAccounts[ai];
-          html += '<option value="' + esc(a) + '"' + (a === accountId ? ' selected' : '') + '>' + esc(a) + '</option>';
-        }
-        html += '</select></div>';
+        html += '<div class="field"><label>Klaviyo Account</label><select id="accountInput">' + getAccountOptionsHtml() + '</select></div>';
       } else {
         html += '<div class="field"><label>Klaviyo Account</label><input id="accountInput" value="' + esc(accountId) + '" placeholder="default / brick / tc" /></div>';
       }
+
       html += '<div class="row"><button id="loadAccountsBtn" class="btn btn-muted">Load Accounts</button><div></div></div>';
       html += '<div class="row">';
       html += '<div class="field"><label>Header Height (px)</label><input id="headerInput" value="' + esc(headerHeight) + '" placeholder="0" /></div>';
@@ -223,7 +260,7 @@
         html += '<div class="layout">';
         html += '  <div>';
         html += '    <div class="preview-wrap"><img id="previewImg" src="data:image/png;base64,' + esc(preview.base64) + '" /><canvas id="overlay"></canvas></div>';
-        html += '    <div class="tiny">Auto suggestions allow multi-column slices. Use move/resize/add/remove to refine.</div>';
+        html += '    <div class="tiny">Auto suggestions are full-width sections. Manual draw lets you fine-tune.</div>';
         html += '  </div>';
         html += '  <div class="side">';
 
@@ -237,17 +274,16 @@
           }
           html += '</div>';
 
-          var s = getSelectedSlice() || { rect: { x: 0, y: 0, width: 0, height: 0 } };
+          var s = getSelectedSlice() || { rect: { x: 0, y: 0, width: 0, height: 0 }, url: '', label: '', alt: '' };
           html += '<div class="row">';
-          html += '<div class="field"><label>X</label><input id="sliceX" value="' + esc(s.rect && s.rect.x || 0) + '" /></div>';
-          html += '<div class="field"><label>Y</label><input id="sliceY" value="' + esc(s.rect && s.rect.y || 0) + '" /></div>';
+          html += '<div class="field"><label>X</label><input id="sliceX" value="' + esc(s.rect.x || 0) + '" /></div>';
+          html += '<div class="field"><label>Y</label><input id="sliceY" value="' + esc(s.rect.y || 0) + '" /></div>';
           html += '</div>';
           html += '<div class="row">';
-          html += '<div class="field"><label>Width</label><input id="sliceW" value="' + esc(s.rect && s.rect.width || 0) + '" /></div>';
-          html += '<div class="field"><label>Height</label><input id="sliceH" value="' + esc(s.rect && s.rect.height || 0) + '" /></div>';
+          html += '<div class="field"><label>Width</label><input id="sliceW" value="' + esc(s.rect.width || 0) + '" /></div>';
+          html += '<div class="field"><label>Height</label><input id="sliceH" value="' + esc(s.rect.height || 0) + '" /></div>';
           html += '</div>';
-          html += '<div class="row" style="margin-bottom:8px;"><button id="cloneSelectedBtn" class="btn btn-muted">Clone Selected</button><div></div></div>';
-          html += '<div class="row"><button id="removeSelectedBtn" class="btn btn-muted">Remove</button><button id="removeAllBtn" class="btn btn-muted">Remove All</button></div>';
+          html += '<div class="row-3"><button id="cloneSelectedBtn" class="btn btn-muted">Clone</button><button id="removeSelectedBtn" class="btn btn-muted">Remove</button><button id="removeAllBtn" class="btn btn-muted">Remove All</button></div>';
         }
 
         html += '  </div>';
@@ -264,8 +300,11 @@
     function bind() {
       document.getElementById('batchInput').addEventListener('input', function(e) { batchName = e.target.value; });
       document.getElementById('backendInput').addEventListener('input', function(e) { backendUrl = e.target.value.trim(); });
-      document.getElementById('accountInput').addEventListener('input', function(e) { accountId = String(e.target.value || '').trim(); });
-      document.getElementById('accountInput').addEventListener('change', function(e) { accountId = String(e.target.value || '').trim(); });
+
+      var accountInput = document.getElementById('accountInput');
+      accountInput.addEventListener('input', function(e) { accountId = String(e.target.value || '').trim(); });
+      accountInput.addEventListener('change', function(e) { accountId = String(e.target.value || '').trim(); });
+
       document.getElementById('loadAccountsBtn').addEventListener('click', function() { loadAccounts(false); });
       document.getElementById('headerInput').addEventListener('input', function(e) { headerHeight = e.target.value; });
       document.getElementById('footerInput').addEventListener('input', function(e) { footerHeight = e.target.value; });
@@ -273,6 +312,7 @@
 
       document.getElementById('lockBtn').addEventListener('click', function() { parent.postMessage({ pluginMessage: { type: 'lock-frame' } }, '*'); });
       document.getElementById('unlockBtn').addEventListener('click', function() { parent.postMessage({ pluginMessage: { type: 'unlock-frame' } }, '*'); });
+
       document.getElementById('refreshBtn2').addEventListener('click', function() {
         resetWorkingState();
         setStatus('Selection refreshed.', 'success');
@@ -318,12 +358,13 @@
         function updateRectFromInputs() {
           var s = getSelectedSlice();
           if (!s) return;
+          var prev = { x: s.rect.x, y: s.rect.y, width: s.rect.width, height: s.rect.height };
           s.rect = clampRectAgainstNeighbors(selectedSliceIndex, {
             x: document.getElementById('sliceX').value,
             y: document.getElementById('sliceY').value,
             width: document.getElementById('sliceW').value,
             height: document.getElementById('sliceH').value
-          });
+          }, prev);
           render();
         }
 
@@ -332,25 +373,7 @@
         document.getElementById('sliceW').addEventListener('change', updateRectFromInputs);
         document.getElementById('sliceH').addEventListener('change', updateRectFromInputs);
 
-        document.getElementById('cloneSelectedBtn').addEventListener('click', function() {
-          var s = getSelectedSlice();
-          if (!s) return;
-          var clone = {
-            rect: normalizeRect({
-              x: Number(s.rect.x || 0) + 12,
-              y: Number(s.rect.y || 0) + 12,
-              width: s.rect.width,
-              height: s.rect.height
-            }),
-            url: String(s.url || ''),
-            label: String(s.label || ''),
-            alt: String(s.alt || '')
-          };
-          var insertAt = selectedSliceIndex + 1;
-          slices.splice(insertAt, 0, clone);
-          selectedSliceIndex = insertAt;
-          render();
-        });
+        document.getElementById('cloneSelectedBtn').addEventListener('click', function() { cloneSelectedSlice(); });
 
         document.getElementById('removeSelectedBtn').addEventListener('click', function() {
           if (selectedSliceIndex < 0 || selectedSliceIndex >= slices.length) return;
@@ -369,10 +392,7 @@
 
       document.getElementById('pushBtn').addEventListener('click', function() {
         if (!batchName && frame) batchName = frame.name;
-        if (!batchName) {
-          setStatus('Batch name is required.', 'error');
-          return;
-        }
+        if (!batchName) return setStatus('Batch name is required.', 'error');
         setStatus('Exporting frame from Figma...', 'loading');
         parent.postMessage({ pluginMessage: { type: 'export', manualSlices: slices } }, '*');
       });
@@ -434,4 +454,377 @@
           var s = slices[i].rect;
           if (logicalX >= s.x && logicalX <= s.x + s.width && logicalY >= s.y && logicalY <= s.y + s.height) return i;
         }
-        return -1
+        return -1;
+      }
+
+      function getCornerHandles(box) {
+        return [
+          { name: 'tl', x: box.x, y: box.y, cursor: 'nwse-resize' },
+          { name: 'tr', x: box.x + box.width, y: box.y, cursor: 'nesw-resize' },
+          { name: 'bl', x: box.x, y: box.y + box.height, cursor: 'nesw-resize' },
+          { name: 'br', x: box.x + box.width, y: box.y + box.height, cursor: 'nwse-resize' }
+        ];
+      }
+
+      function findHandleAtCanvasPoint(p) {
+        if (selectedSliceIndex < 0 || selectedSliceIndex >= slices.length) return null;
+        var box = logicalToCanvas(slices[selectedSliceIndex].rect);
+        var handles = getCornerHandles(box);
+        for (var i = 0; i < handles.length; i++) {
+          var h = handles[i];
+          var dx = p.x - h.x;
+          var dy = p.y - h.y;
+          if ((dx * dx) + (dy * dy) <= (handleRadius + 2) * (handleRadius + 2)) return h;
+        }
+        return null;
+      }
+
+      function drawHandlesForSelected(box) {
+        var handles = getCornerHandles(box);
+        for (var i = 0; i < handles.length; i++) {
+          var h = handles[i];
+          ctx.beginPath();
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 2;
+          ctx.arc(h.x, h.y, handleRadius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+
+      function resizeRectFromHandle(startRect, handleName, logicalPoint) {
+        var left = startRect.x, top = startRect.y, right = startRect.x + startRect.width, bottom = startRect.y + startRect.height;
+        if (handleName === 'tl') { left = logicalPoint.x; top = logicalPoint.y; }
+        else if (handleName === 'tr') { right = logicalPoint.x; top = logicalPoint.y; }
+        else if (handleName === 'bl') { left = logicalPoint.x; bottom = logicalPoint.y; }
+        else if (handleName === 'br') { right = logicalPoint.x; bottom = logicalPoint.y; }
+
+        var x = Math.min(left, right);
+        var y = Math.min(top, bottom);
+        var w = Math.abs(right - left);
+        var h = Math.abs(bottom - top);
+        if (w < minLogicalSize) w = minLogicalSize;
+        if (h < minLogicalSize) h = minLogicalSize;
+
+        var curr = getSelectedSlice();
+        var prev = curr ? { x: curr.rect.x, y: curr.rect.y, width: curr.rect.width, height: curr.rect.height } : null;
+        return clampRectAgainstNeighbors(selectedSliceIndex, { x: x, y: y, width: w, height: h }, prev);
+      }
+
+      function redraw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        for (var i = 0; i < slices.length; i++) {
+          var box = logicalToCanvas(slices[i].rect);
+          var active = i === selectedSliceIndex;
+          ctx.fillStyle = active ? 'rgba(245,158,11,0.25)' : 'rgba(79,70,229,0.16)';
+          ctx.strokeStyle = active ? '#f59e0b' : '#4f46e5';
+          ctx.lineWidth = active ? 3 : 2;
+          ctx.fillRect(box.x, box.y, box.width, box.height);
+          ctx.strokeRect(box.x, box.y, box.width, box.height);
+          ctx.fillStyle = active ? '#92400e' : '#312e81';
+          ctx.font = 'bold 11px Inter, sans-serif';
+          ctx.fillText(String(i + 1), box.x + 4, box.y + 14);
+          if (active) drawHandlesForSelected(box);
+        }
+        if (draw.active) {
+          var x = Math.min(draw.startX, draw.currentX);
+          var y = Math.min(draw.startY, draw.currentY);
+          var w = Math.abs(draw.currentX - draw.startX);
+          var h = Math.abs(draw.currentY - draw.startY);
+          ctx.fillStyle = 'rgba(16,185,129,0.2)';
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = 2;
+          ctx.fillRect(x, y, w, h);
+          ctx.strokeRect(x, y, w, h);
+        }
+      }
+
+      canvas.onpointerdown = function(evt) {
+        var p = toCanvas(evt);
+        if (!addSliceMode) {
+          var handle = findHandleAtCanvasPoint(p);
+          if (handle && selectedSliceIndex >= 0 && selectedSliceIndex < slices.length) {
+            resize.active = true;
+            resize.handle = handle.name;
+            resize.startRect = { x: slices[selectedSliceIndex].rect.x, y: slices[selectedSliceIndex].rect.y, width: slices[selectedSliceIndex].rect.width, height: slices[selectedSliceIndex].rect.height };
+            resize.pointerId = evt.pointerId;
+            if (canvas.setPointerCapture) canvas.setPointerCapture(evt.pointerId);
+            return;
+          }
+
+          var lx = Math.round((p.x / canvas.width) * preview.width);
+          var ly = Math.round((p.y / canvas.height) * preview.height);
+          var idx = hit(lx, ly);
+          if (idx >= 0) {
+            if (selectedSliceIndex !== idx) { selectedSliceIndex = idx; render(); return; }
+            var s = getSelectedSlice();
+            if (s) {
+              move.active = true;
+              move.startRect = { x: s.rect.x, y: s.rect.y, width: s.rect.width, height: s.rect.height };
+              move.offsetX = lx - s.rect.x;
+              move.offsetY = ly - s.rect.y;
+              move.pointerId = evt.pointerId;
+              if (canvas.setPointerCapture) canvas.setPointerCapture(evt.pointerId);
+            }
+          } else if (selectedSliceIndex !== -1) {
+            selectedSliceIndex = -1;
+            redraw();
+          }
+          return;
+        }
+
+        draw.active = true;
+        draw.startX = p.x;
+        draw.startY = p.y;
+        draw.currentX = p.x;
+        draw.currentY = p.y;
+        draw.pointerId = evt.pointerId;
+        if (canvas.setPointerCapture) canvas.setPointerCapture(evt.pointerId);
+        redraw();
+      };
+
+      canvas.onpointermove = function(evt) {
+        if (resize.active) {
+          var rp = toCanvas(evt);
+          var logical = canvasPointToLogical(rp);
+          var s = getSelectedSlice();
+          if (!s) return;
+          s.rect = resizeRectFromHandle(resize.startRect, resize.handle, logical);
+          redraw();
+          return;
+        }
+
+        if (move.active) {
+          var mp = toCanvas(evt);
+          var mLogical = canvasPointToLogical(mp);
+          var current = getSelectedSlice();
+          if (!current) return;
+          var prev = { x: current.rect.x, y: current.rect.y, width: current.rect.width, height: current.rect.height };
+          current.rect = clampRectAgainstNeighbors(selectedSliceIndex, {
+            x: mLogical.x - move.offsetX,
+            y: mLogical.y - move.offsetY,
+            width: move.startRect.width,
+            height: move.startRect.height
+          }, prev);
+          redraw();
+          return;
+        }
+
+        if (!draw.active) return;
+        var p = toCanvas(evt);
+        draw.currentX = p.x;
+        draw.currentY = p.y;
+        redraw();
+      };
+
+      canvas.onpointerup = function(evt) {
+        if (move.active) {
+          if (canvas.releasePointerCapture && move.pointerId !== null) { try { canvas.releasePointerCapture(move.pointerId); } catch (_e0) {} }
+          move.active = false;
+          move.pointerId = null;
+          render();
+          return;
+        }
+
+        if (resize.active) {
+          if (canvas.releasePointerCapture && resize.pointerId !== null) { try { canvas.releasePointerCapture(resize.pointerId); } catch (_e) {} }
+          resize.active = false;
+          resize.pointerId = null;
+          render();
+          return;
+        }
+
+        if (!draw.active) return;
+
+        var p = toCanvas(evt);
+        draw.currentX = p.x;
+        draw.currentY = p.y;
+
+        var x = Math.min(draw.startX, draw.currentX);
+        var y = Math.min(draw.startY, draw.currentY);
+        var w = Math.abs(draw.currentX - draw.startX);
+        var h = Math.abs(draw.currentY - draw.startY);
+
+        if (canvas.releasePointerCapture && draw.pointerId !== null) { try { canvas.releasePointerCapture(draw.pointerId); } catch (_e2) {} }
+        draw.active = false;
+        draw.pointerId = null;
+
+        if (w >= 8 && h >= 8) {
+          slices.push({ rect: canvasToLogical(x, y, w, h), url: '', label: '', alt: '' });
+          selectedSliceIndex = slices.length - 1;
+          addSliceMode = false;
+          setStatus('Slice added.', 'success');
+          return;
+        }
+
+        redraw();
+      };
+
+      canvas.onpointercancel = function() {
+        if (move.active) { move.active = false; move.pointerId = null; }
+        if (resize.active) { resize.active = false; resize.pointerId = null; }
+        draw.active = false;
+        draw.pointerId = null;
+        redraw();
+      };
+
+      if (teardownOutsideClick) teardownOutsideClick();
+      var onDocPointerDown = function(evt) {
+        var target = evt.target;
+        var previewWrap = document.querySelector('.preview-wrap');
+        var sidePanel = document.querySelector('.side');
+        var toolbar = document.querySelector('.toolbar');
+        if (!previewWrap) return;
+        if (previewWrap.contains(target)) return;
+        if (sidePanel && sidePanel.contains(target)) return;
+        if (toolbar && toolbar.contains(target)) return;
+
+        var changed = false;
+        if (addSliceMode) { addSliceMode = false; changed = true; }
+        if (draw.active) { draw.active = false; draw.pointerId = null; changed = true; }
+        if (resize.active) { resize.active = false; resize.pointerId = null; changed = true; }
+        if (move.active) { move.active = false; move.pointerId = null; changed = true; }
+        if (selectedSliceIndex !== -1) { selectedSliceIndex = -1; changed = true; }
+
+        if (changed) render();
+      };
+      document.addEventListener('pointerdown', onDocPointerDown, true);
+      teardownOutsideClick = function() { document.removeEventListener('pointerdown', onDocPointerDown, true); };
+
+      redraw();
+    }
+
+    function pushViaBackend(data) {
+      return fetch(backendUrl.replace(/\/$/, '') + '/api/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: accountId || 'default',
+          batchName: batchName || data.name,
+          imageBase64: data.base64,
+          logicalWidth: data.logicalWidth,
+          logicalHeight: data.logicalHeight,
+          pixelRatio: data.pixelRatio,
+          exportWidth: data.exportWidth,
+          exportHeight: data.exportHeight,
+          headerHeight: Number(headerHeight || 0),
+          footerHeight: Number(footerHeight || 0),
+          maxSliceHeight: Number(maxSliceHeight || 0),
+          manualSlices: data.manualSlices || [],
+          frameName: data.name
+        })
+      }).then(function(res) {
+        return res.json().then(function(json) {
+          if (!res.ok) throw new Error(json.error || 'Upload failed');
+          return json;
+        });
+      });
+    }
+
+    function setStatus(msg, type) {
+      status = msg;
+      statusType = type;
+      render();
+    }
+
+    function loadAccounts(silent) {
+      return fetch(backendUrl.replace(/\/$/, '') + '/api/accounts')
+        .then(function(res) {
+          return res.json().then(function(json) {
+            if (!res.ok) throw new Error(json.error || 'Failed to load accounts');
+            return json;
+          });
+        })
+        .then(function(json) {
+          var raw = Array.isArray(json.accounts) ? json.accounts : [];
+          var normalized = [];
+          for (var i = 0; i < raw.length; i++) {
+            var item = raw[i];
+            if (typeof item === 'string') normalized.push({ id: item, name: item });
+            else if (item && typeof item === 'object' && item.id) normalized.push({ id: String(item.id), name: String(item.name || item.id) });
+          }
+          availableAccounts = normalized;
+
+          if (availableAccounts.length) {
+            var found = false;
+            for (var j = 0; j < availableAccounts.length; j++) {
+              if (availableAccounts[j].id === accountId) { found = true; break; }
+            }
+            if (!found) accountId = availableAccounts[0].id;
+          }
+
+          if (!silent) setStatus('Loaded accounts: ' + (availableAccounts.map(function(a){ return a.id; }).join(', ') || 'none'), 'success');
+          render();
+        })
+        .catch(function(err) {
+          availableAccounts = [];
+          if (!silent) setStatus(String(err.message || err), 'error');
+          render();
+        });
+    }
+
+    window.onmessage = function(event) {
+      var msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      if (msg.type === 'update') {
+        frame = msg.frame || null;
+        errorMsg = msg.error || null;
+        locked = !!msg.locked;
+        if (frame && !batchName) batchName = frame.name;
+        if (!frame) {
+          preview = { ready: false, base64: '', width: 0, height: 0, displayWidth: 0, displayHeight: 0 };
+          slices = [];
+          selectedSliceIndex = -1;
+          addSliceMode = false;
+        }
+        status = '';
+        statusType = '';
+        render();
+      }
+
+      if (msg.type === 'preview-error') setStatus(msg.message || 'Preview failed', 'error');
+      if (msg.type === 'suggest-error') setStatus(msg.message || 'Auto suggest failed', 'error');
+      if (msg.type === 'export-error') setStatus(msg.message || 'Export failed', 'error');
+
+      if (msg.type === 'preview-done') {
+        preview.ready = true;
+        preview.base64 = msg.base64;
+        preview.width = msg.logicalWidth;
+        preview.height = msg.logicalHeight;
+        setStatus('Preview loaded.', 'success');
+      }
+
+      if (msg.type === 'suggest-done') {
+        slices = Array.isArray(msg.slices) ? msg.slices : [];
+        selectedSliceIndex = slices.length ? 0 : -1;
+        addSliceMode = false;
+        setStatus('Auto-suggested slices: ' + slices.length, 'success');
+      }
+
+      if (msg.type === 'export-done') {
+        setStatus('Compressing and uploading slices to Klaviyo...', 'loading');
+        pushViaBackend(msg)
+          .then(function(result) {
+            var totalOriginal = 0;
+            var totalCompressed = 0;
+            for (var i = 0; i < result.slices.length; i++) {
+              totalOriginal += Number(result.slices[i].originalKb || 0);
+              totalCompressed += Number(result.slices[i].compressedKb || 0);
+            }
+            var summary = 'Uploaded ' + result.sliceCount + ' slices to ' + (result.accountId || accountId || 'default') + ' | ' + Math.round(totalOriginal) + 'KB -> ' + Math.round(totalCompressed) + 'KB';
+            setStatus(summary, 'success');
+            parent.postMessage({ pluginMessage: { type: 'notify', message: summary } }, '*');
+          })
+          .catch(function(err) {
+            setStatus(String(err.message || err), 'error');
+          });
+      }
+    };
+
+    render();
+    loadAccounts(true);
+  </script>
+</body>
+</html>
